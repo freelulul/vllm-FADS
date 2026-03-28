@@ -220,7 +220,7 @@ class Worker(WorkerBase):
 
         # Migrated models (no cumem) use pseudo-wake instead
         if not self.vllm_config.model_config.enable_sleep_mode:
-            if hasattr(self, '_pseudo_sleep_buffers') and self._pseudo_sleep_buffers:
+            if hasattr(self, '_pinned_weight_store') and self._pinned_weight_store:
                 self._pseudo_wake()
             return
 
@@ -269,24 +269,42 @@ class Worker(WorkerBase):
         logger.info("Saved weight snapshot: %d params to %s", len(tensors), snapshot_path)
 
     def _pseudo_sleep(self) -> None:
-        """Sleep a migrated model by moving weights to CPU via standard PyTorch.
+        """Offload weights to pinned CPU memory via DMA.
 
-        Equivalent to cumem's sleep but for models loaded without cumem
-        (enable_sleep_mode=False). Moves all model parameters to CPU and
-        frees GPU cache, making room for other models to wake.
+        Uses page-locked (pinned) memory for GPU→CPU transfer, enabling
+        DMA-accelerated async copies. Pinned buffers are allocated once on
+        first call and reused on subsequent sleep/wake cycles.
         """
         t0 = _time.perf_counter()
         free_before = torch.cuda.mem_get_info()[0]
-
-        # Move all model parameters to CPU
         model = self.model_runner.model
-        self._pseudo_sleep_buffers = {}
+
+        # Allocate pinned CPU buffers on first sleep; reuse thereafter
+        if not hasattr(self, '_pinned_weight_store') or not self._pinned_weight_store:
+            alloc_t0 = _time.perf_counter()
+            self._pinned_weight_store = {}
+            for name, param in model.named_parameters():
+                self._pinned_weight_store[name] = torch.empty_like(
+                    param.data, device="cpu", pin_memory=True)
+            for name, buffer in model.named_buffers():
+                self._pinned_weight_store[f"__buffer__{name}"] = torch.empty_like(
+                    buffer.data, device="cpu", pin_memory=True)
+            logger.info("Allocated pinned memory for %d tensors in %.2fs",
+                         len(self._pinned_weight_store),
+                         _time.perf_counter() - alloc_t0)
+
+        # Async DMA copy: GPU → pinned CPU
         for name, param in model.named_parameters():
-            self._pseudo_sleep_buffers[name] = param.data.cpu()
-            param.data = torch.empty(0, device="cpu")
-        # Also save and clear buffers (rope, layernorm, etc.)
+            self._pinned_weight_store[name].copy_(param.data, non_blocking=True)
         for name, buffer in model.named_buffers():
-            self._pseudo_sleep_buffers[f"__buffer__{name}"] = buffer.data.cpu()
+            self._pinned_weight_store[f"__buffer__{name}"].copy_(
+                buffer.data, non_blocking=True)
+        torch.cuda.synchronize()
+
+        # Free GPU tensors (safe: all copies completed)
+        for name, param in model.named_parameters():
+            param.data = torch.empty(0, device="cpu")
+        for name, buffer in model.named_buffers():
             buffer.data = torch.empty(0, device="cpu")
 
         gc.collect()
@@ -298,20 +316,22 @@ class Worker(WorkerBase):
                      _time.perf_counter() - t0)
 
     def _pseudo_wake(self) -> None:
-        """Wake a pseudo-slept model by moving weights back to GPU."""
+        """Restore weights from pinned CPU memory via DMA."""
         t0 = _time.perf_counter()
-
         model = self.model_runner.model
+        store = self._pinned_weight_store
+
+        # Async DMA copy: pinned CPU → GPU
         for name, param in model.named_parameters():
-            key = name
-            if key in self._pseudo_sleep_buffers:
-                param.data = self._pseudo_sleep_buffers[key].to(self.device)
+            if name in store:
+                param.data = store[name].to(self.device, non_blocking=True)
         for name, buffer in model.named_buffers():
             key = f"__buffer__{name}"
-            if key in self._pseudo_sleep_buffers:
-                buffer.data = self._pseudo_sleep_buffers[key].to(self.device)
+            if key in store:
+                buffer.data = store[key].to(self.device, non_blocking=True)
 
-        self._pseudo_sleep_buffers = {}
+        torch.cuda.synchronize()
+        # Keep _pinned_weight_store alive for reuse on next sleep cycle
         logger.info("Pseudo-wake restored weights in %.2fs",
                      _time.perf_counter() - t0)
 
@@ -381,6 +401,10 @@ class Worker(WorkerBase):
             if name in real_weights:
                 param.data.copy_(real_weights[name])
                 loaded += 1
+        del real_weights
+        gc.collect()
+        # Ensure all weight copies are complete before any CUDA kernel launch
+        torch.cuda.synchronize()
 
         # 7. Initialize KV cache (use actual free memory, not profiling)
         with set_current_vllm_config(self.vllm_config):
