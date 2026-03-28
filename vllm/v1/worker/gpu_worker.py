@@ -171,13 +171,14 @@ class Worker(WorkerBase):
         my_name = self._get_served_name()
         for t in glob.glob("/tmp/fads_snapshot_*"):
             try:
-                req = _json.loads(open(t).read())
+                with open(t) as f:
+                    req = _json.loads(f.read())
                 if req.get("served_model_name") == my_name:
                     self.save_weight_snapshot(req["snapshot_path"])
                     os.remove(t)
                     break
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Snapshot trigger error for %s: %s", t, e)
 
         # Migrated models (no cumem) use pseudo-sleep instead
         if not self.vllm_config.model_config.enable_sleep_mode:
@@ -210,7 +211,8 @@ class Worker(WorkerBase):
         my_name = self._get_served_name()
         for t in glob.glob("/tmp/fads_reload_*"):
             try:
-                req = _json.loads(open(t).read())
+                with open(t) as f:
+                    req = _json.loads(f.read())
                 if req.get("served_model_name") == my_name:
                     os.remove(t)
                     self.reload_for_migration(req["model_path"], req["snapshot_path"])
