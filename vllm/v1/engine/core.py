@@ -285,6 +285,40 @@ class EngineCore:
         )
         return scheduler_kv_cache_config
 
+    def _apply_migration_kv_config(self, new_kv_cache_config) -> None:
+        """Rebuild the scheduler after a cross-GPU model migration.
+
+        The worker's reload_for_migration() has already loaded the new model
+        and initialized its KV cache. Now the EngineCore scheduler must be
+        updated to match the new model's KV cache structure (different head
+        count, block size, etc.).
+        """
+        vllm_config = self.vllm_config
+        vllm_config.cache_config.num_gpu_blocks = new_kv_cache_config.num_blocks
+        if new_kv_cache_config.kv_cache_groups:
+            vllm_config.cache_config.block_size = min(
+                g.kv_cache_spec.block_size
+                for g in new_kv_cache_config.kv_cache_groups
+            )
+
+        scheduler_block_size = (
+            vllm_config.cache_config.block_size
+            * vllm_config.parallel_config.decode_context_parallel_size
+            * vllm_config.parallel_config.prefill_context_parallel_size
+        )
+
+        Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
+        self.scheduler = Scheduler(
+            vllm_config=vllm_config,
+            kv_cache_config=new_kv_cache_config,
+            structured_output_manager=self.structured_output_manager,
+            include_finished_set=False,
+            log_stats=self.log_stats,
+            block_size=scheduler_block_size,
+        )
+        logger.info("Scheduler rebuilt for migrated model: %d blocks, block_size=%d",
+                     new_kv_cache_config.num_blocks, vllm_config.cache_config.block_size)
+
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_executor.supported_tasks
 
@@ -690,6 +724,12 @@ class EngineCore:
 
         if tags is None or tags:
             self.model_executor.wake_up(tags)
+
+        # Check if a migration occurred — if so, rebuild scheduler for new model
+        import vllm.v1.worker.gpu_worker as gpu_worker_module
+        if gpu_worker_module._pending_migration_kv_config is not None:
+            self._apply_migration_kv_config(gpu_worker_module._pending_migration_kv_config)
+            gpu_worker_module._pending_migration_kv_config = None
 
         # Resume scheduling (applies to all levels)
         self.resume_scheduler()

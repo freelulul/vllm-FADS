@@ -225,6 +225,18 @@ class CuMemAllocator:
         gc.collect()
         torch.cuda.empty_cache()
 
+    def clear_all_backups(self) -> None:
+        """Discard all allocation tracking and CPU backups for model reload.
+
+        Call after sleep() to prepare for loading a completely different model.
+        Safe because sleep() already freed all GPU memory (cuMemUnmap + cuMemRelease).
+        Keeps allocator_and_pools intact to avoid corrupting PyTorch's allocator.
+        """
+        for data in self.pointer_to_data.values():
+            data.cpu_backup_tensor = None
+        self.pointer_to_data.clear()
+        gc.collect()
+
     def wake_up(self, tags: list[str] | None = None) -> None:
         """
         Wake up the allocator from sleep mode.

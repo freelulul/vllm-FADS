@@ -3,7 +3,10 @@
 """A GPU worker class."""
 
 import gc
+import glob
+import json as _json
 import os
+import time as _time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from datetime import timedelta
@@ -64,6 +67,11 @@ from .gpu.warmup import warmup_kernels
 from .utils import request_memory
 
 logger = init_logger(__name__)
+
+# Set by Worker.reload_for_migration(), read by EngineCore.wake_up().
+# Contains the new KVCacheConfig after a cross-GPU migration so the
+# EngineCore can rebuild its scheduler to match the new model.
+_pending_migration_kv_config = None
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -159,6 +167,23 @@ class Worker(WorkerBase):
 
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
 
+        # Check for snapshot save request (file-based trigger from scheduler)
+        my_name = self._get_served_name()
+        for t in glob.glob("/tmp/fads_snapshot_*"):
+            try:
+                req = _json.loads(open(t).read())
+                if req.get("served_model_name") == my_name:
+                    self.save_weight_snapshot(req["snapshot_path"])
+                    os.remove(t)
+                    break
+            except Exception:
+                pass
+
+        # Migrated models (no cumem) use pseudo-sleep instead
+        if not self.vllm_config.model_config.enable_sleep_mode:
+            self._pseudo_sleep()
+            return
+
         # Save the buffers before level 2 sleep
         if level == 2:
             model = self.model_runner.model
@@ -181,6 +206,24 @@ class Worker(WorkerBase):
     def wake_up(self, tags: list[str] | None = None) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
 
+        # Check for reload request (file-based trigger from scheduler)
+        my_name = self._get_served_name()
+        for t in glob.glob("/tmp/fads_reload_*"):
+            try:
+                req = _json.loads(open(t).read())
+                if req.get("served_model_name") == my_name:
+                    os.remove(t)
+                    self.reload_for_migration(req["model_path"], req["snapshot_path"])
+                    return  # reload handles its own wake
+            except Exception as e:
+                logger.error("Migration reload failed: %s", e, exc_info=True)
+
+        # Migrated models (no cumem) use pseudo-wake instead
+        if not self.vllm_config.model_config.enable_sleep_mode:
+            if hasattr(self, '_pseudo_sleep_buffers') and self._pseudo_sleep_buffers:
+                self._pseudo_wake()
+            return
+
         allocator = CuMemAllocator.get_instance()
         allocator.wake_up(tags)
 
@@ -201,6 +244,171 @@ class Worker(WorkerBase):
             and hasattr(self.model_runner, "init_fp8_kv_scales")
         ):
             self.model_runner.init_fp8_kv_scales()
+
+    def _get_served_name(self) -> str:
+        """Get the served model name as a string."""
+        name = self.vllm_config.model_config.served_model_name
+        if isinstance(name, list):
+            return name[0] if name else ""
+        return name or ""
+
+    def save_weight_snapshot(self, snapshot_path: str) -> None:
+        """Save model weights to safetensors for cross-GPU migration.
+
+        Call while model is ACTIVE (weights on GPU). The snapshot can later
+        be loaded by reload_for_migration() on any GPU.
+        """
+        from safetensors.torch import save_file
+
+        tensors = {
+            name: param.data.cpu().contiguous()
+            for name, param in self.model_runner.model.named_parameters()
+        }
+        os.makedirs(snapshot_path, exist_ok=True)
+        save_file(tensors, os.path.join(snapshot_path, "snapshot.safetensors"))
+        logger.info("Saved weight snapshot: %d params to %s", len(tensors), snapshot_path)
+
+    def _pseudo_sleep(self) -> None:
+        """Sleep a migrated model by moving weights to CPU via standard PyTorch.
+
+        Equivalent to cumem's sleep but for models loaded without cumem
+        (enable_sleep_mode=False). Moves all model parameters to CPU and
+        frees GPU cache, making room for other models to wake.
+        """
+        t0 = _time.perf_counter()
+        free_before = torch.cuda.mem_get_info()[0]
+
+        # Move all model parameters to CPU
+        model = self.model_runner.model
+        self._pseudo_sleep_buffers = {}
+        for name, param in model.named_parameters():
+            self._pseudo_sleep_buffers[name] = param.data.cpu()
+            param.data = torch.empty(0, device="cpu")
+        # Also save and clear buffers (rope, layernorm, etc.)
+        for name, buffer in model.named_buffers():
+            self._pseudo_sleep_buffers[f"__buffer__{name}"] = buffer.data.cpu()
+            buffer.data = torch.empty(0, device="cpu")
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        free_after = torch.cuda.mem_get_info()[0]
+        logger.info("Pseudo-sleep freed %.1f GiB in %.2fs",
+                     (free_after - free_before) / 1024**3,
+                     _time.perf_counter() - t0)
+
+    def _pseudo_wake(self) -> None:
+        """Wake a pseudo-slept model by moving weights back to GPU."""
+        t0 = _time.perf_counter()
+
+        model = self.model_runner.model
+        for name, param in model.named_parameters():
+            key = name
+            if key in self._pseudo_sleep_buffers:
+                param.data = self._pseudo_sleep_buffers[key].to(self.device)
+        for name, buffer in model.named_buffers():
+            key = f"__buffer__{name}"
+            if key in self._pseudo_sleep_buffers:
+                buffer.data = self._pseudo_sleep_buffers[key].to(self.device)
+
+        self._pseudo_sleep_buffers = {}
+        logger.info("Pseudo-wake restored weights in %.2fs",
+                     _time.perf_counter() - t0)
+
+    def reload_for_migration(self, new_model_path: str, snapshot_path: str) -> None:
+        """Hot-swap the current model with a different model in ~0.5-5s.
+
+        Uses a pre-saved weight snapshot (safetensors in /dev/shm/) to bypass
+        the full model loading pipeline. The process stays alive — no restart.
+
+        The migrated model uses PyTorch standard allocator (not cumem) because
+        the existing cumem MemPool cannot be cleanly reused across different
+        models due to PyTorch caching allocator constraints. Sleep/wake for
+        the migrated model uses _pseudo_sleep/_pseudo_wake instead.
+        """
+        from safetensors.torch import load_file
+
+        from vllm.config import ModelConfig
+        from vllm.device_allocator.cumem import CuMemAllocator
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
+
+        t0 = _time.perf_counter()
+
+        # 1. Clear old model's cumem state (already sleeping, GPU memory freed)
+        allocator = CuMemAllocator.get_instance()
+        allocator.clear_all_backups()
+
+        # 2. Delete old model runner
+        del self.model_runner
+        self.model_runner = None  # type: ignore
+        gc.collect()
+
+        # 3. Create fresh ModelConfig from new model's config.json
+        old_mc = self.vllm_config.model_config
+        self.vllm_config.model_config = ModelConfig(
+            model=new_model_path,
+            tokenizer=new_model_path,
+            dtype=old_mc.dtype,
+            seed=old_mc.seed,
+            enforce_eager=True,
+            enable_sleep_mode=False,
+            served_model_name=old_mc.served_model_name,
+        )
+        self.vllm_config.compilation_config.static_forward_context.clear()
+        self.model_config = self.vllm_config.model_config
+
+        # 4. Create new model runner
+        if self.use_v2_model_runner:
+            from vllm.v1.worker.gpu.model_runner import (
+                GPUModelRunner as GPUModelRunnerV2,
+            )
+            self.model_runner = GPUModelRunnerV2(self.vllm_config, self.device)
+        else:
+            from vllm.v1.worker.gpu_model_runner import (
+                GPUModelRunner as GPUModelRunnerV1,
+            )
+            self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
+
+        # 5. Load architecture with dummy weights (fast: skips safetensors I/O)
+        with set_current_vllm_config(self.vllm_config):
+            self.model_runner.load_model(load_dummy_weights=True)
+
+        # 6. Overwrite dummy weights with real weights from snapshot
+        snapshot_file = os.path.join(snapshot_path, "snapshot.safetensors")
+        real_weights = load_file(snapshot_file, device="cpu")
+        loaded = 0
+        for name, param in self.model_runner.model.named_parameters():
+            if name in real_weights:
+                param.data.copy_(real_weights[name])
+                loaded += 1
+
+        # 7. Initialize KV cache (use actual free memory, not profiling)
+        with set_current_vllm_config(self.vllm_config):
+            kv_cache_spec = self.get_kv_cache_spec()
+            free_bytes = torch.cuda.mem_get_info()[0]
+            available_memory = int(free_bytes * 0.9)
+            kv_cache_configs = get_kv_cache_configs(
+                self.vllm_config, [kv_cache_spec], [available_memory]
+            )
+            self.initialize_from_config(kv_cache_configs[0])
+
+            # Signal the EngineCore to rebuild its scheduler with new KV config.
+            # Worker and EngineCore are in the same process, so we store the new
+            # config on a module-level variable that EngineCore checks after wake_up.
+            from vllm.v1.core.kv_cache_utils import generate_scheduler_kv_cache_config
+            global _pending_migration_kv_config
+            _pending_migration_kv_config = generate_scheduler_kv_cache_config(
+                kv_cache_configs
+            )
+
+        elapsed = _time.perf_counter() - t0
+        n_params = len(list(self.model_runner.model.named_parameters()))
+        logger.info(
+            "reload_for_migration complete: %s → %s in %.2fs "
+            "(%d/%d params, KV cache %.1f GiB)",
+            old_mc.model, new_model_path, elapsed,
+            loaded, n_params, available_memory / 1024**3,
+        )
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         if not self.vllm_config.model_config.enable_sleep_mode:
