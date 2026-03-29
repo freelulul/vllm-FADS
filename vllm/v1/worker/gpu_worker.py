@@ -277,14 +277,67 @@ class Worker(WorkerBase):
         """
         from safetensors.torch import save_file
         from vllm.device_allocator.cumem import CuMemAllocator
+        import json as _json2
         t0 = _time.perf_counter()
         model = self.model_runner.model
 
-        # Delegate to save_weight_snapshot which uses per-param files
-        # (low CPU memory: only one param in memory at a time)
-        self.save_weight_snapshot(snapshot_path)
-        logger.info("save_snapshot_in_place: %s in %.2fs",
-                     snapshot_path, _time.perf_counter() - t0)
+        # Check if pseudo-sleep (pinned store) or cumem sleeping
+        store = getattr(self, '_pinned_weight_store', {})
+        allocator = CuMemAllocator.get_instance()
+        has_cumem_backups = any(
+            d.cpu_backup_tensor is not None
+            for d in allocator.pointer_to_data.values()
+        )
+
+        if store:
+            # Pseudo-sleep: read from pinned store per-param
+            source = "pinned"
+            def get_tensor(name, param):
+                return store[name].contiguous() if name in store else param.data.cpu().contiguous()
+        elif has_cumem_backups:
+            # Cumem sleeping: read from CPU backup, reconstruct with shape/dtype.
+            # cumem allocations are coalesced — one alloc may contain multiple params.
+            # We match param.data_ptr() to the containing allocation by range check.
+            source = "cumem_backup"
+            # Build (alloc_start, alloc_end, backup) sorted list for range lookup
+            alloc_ranges = []
+            for ptr, d in allocator.pointer_to_data.items():
+                if d.cpu_backup_tensor is not None:
+                    size = d.cpu_backup_tensor.numel()  # bytes (uint8)
+                    alloc_ranges.append((ptr, ptr + size, d.cpu_backup_tensor))
+            alloc_ranges.sort(key=lambda x: x[0])
+            logger.info("cumem backup: %d allocations, total %.1f GiB",
+                        len(alloc_ranges),
+                        sum(r[1]-r[0] for r in alloc_ranges) / 1024**3)
+
+            def get_tensor(name, param):
+                ptr = param.data_ptr()
+                nbytes = param.numel() * param.element_size()
+                # Find containing allocation via binary search
+                for start, end, backup in alloc_ranges:
+                    if start <= ptr < end:
+                        offset = ptr - start
+                        return backup[offset:offset + nbytes].view(param.dtype).reshape(param.shape).contiguous()
+                raise RuntimeError(f"No cumem backup for {name} (ptr={ptr})")
+        else:
+            # Active: read from GPU
+            source = "gpu"
+            def get_tensor(name, param):
+                return param.data.cpu().contiguous()
+
+        os.makedirs(snapshot_path, exist_ok=True)
+        n = 0
+        for name, param in model.named_parameters():
+            cpu_tensor = get_tensor(name, param)
+            safe_name = name.replace("/", "_")
+            save_file({name: cpu_tensor}, os.path.join(snapshot_path, f"{safe_name}.safetensors"))
+            del cpu_tensor
+            n += 1
+        names = [nm for nm, _ in model.named_parameters()]
+        with open(os.path.join(snapshot_path, "manifest.json"), "w") as f:
+            _json2.dump(names, f)
+        logger.info("save_snapshot_in_place (%s): %d params, %s in %.2fs",
+                     source, n, snapshot_path, _time.perf_counter() - t0)
 
     def _pseudo_sleep(self) -> None:
         """Offload weights to pinned CPU memory via DMA.
