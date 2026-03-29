@@ -241,53 +241,18 @@ class Worker(WorkerBase):
             return name[0] if name else ""
         return name or ""
 
-    def _bulk_gpu_to_cpu(self) -> dict[str, torch.Tensor]:
-        """Bulk copy all model parameters from GPU to CPU.
-
-        Allocates a single contiguous pinned buffer, copies all params into it
-        as a flat block via DMA, then slices back into named tensors.
-        Avoids per-parameter pinned alloc overhead (339 mlock calls).
-        """
-        model = self.model_runner.model
-        params = list(model.named_parameters())
-
-        # Compute total size in bytes
-        total_bytes = sum(p.data.numel() * p.data.element_size() for _, p in params)
-
-        # Allocate single pinned buffer
-        flat_pinned = torch.empty(total_bytes, dtype=torch.uint8,
-                                  device="cpu", pin_memory=True)
-
-        # Copy each param into the flat buffer (GPU → pinned, non-blocking)
-        offset = 0
-        slices = []
-        for name, param in params:
-            nbytes = param.data.numel() * param.data.element_size()
-            # View GPU tensor as flat bytes, copy to pinned slice
-            gpu_flat = param.data.view(-1).view(torch.uint8)
-            pinned_slice = flat_pinned[offset:offset + nbytes]
-            pinned_slice.copy_(gpu_flat, non_blocking=True)
-            slices.append((name, offset, nbytes, param.data.shape, param.data.dtype))
-            offset += nbytes
-
-        torch.cuda.synchronize()
-
-        # Slice back into named tensors (zero-copy views of the pinned buffer)
-        tensors = {}
-        for name, off, nbytes, shape, dtype in slices:
-            raw = flat_pinned[off:off + nbytes]
-            tensors[name] = raw.view(dtype).reshape(shape).contiguous()
-
-        return tensors
-
     def save_weight_snapshot(self, snapshot_path: str) -> None:
         """Save model weights to safetensors for cross-GPU migration.
 
-        Call while model is ACTIVE (weights on GPU). Uses bulk async DMA copy.
+        Call while model is ACTIVE (weights on GPU). Each param is copied
+        to CPU individually. For 28 GiB models this takes ~40s (0.7 GB/s).
         """
         from safetensors.torch import save_file
 
-        tensors = self._bulk_gpu_to_cpu()
+        tensors = {
+            name: param.data.cpu().contiguous()
+            for name, param in self.model_runner.model.named_parameters()
+        }
         os.makedirs(snapshot_path, exist_ok=True)
         save_file(tensors, os.path.join(snapshot_path, "snapshot.safetensors"))
         logger.info("Saved weight snapshot: %d params to %s", len(tensors), snapshot_path)
@@ -295,9 +260,9 @@ class Worker(WorkerBase):
     def save_snapshot_in_place(self, snapshot_path: str) -> None:
         """Save model weight snapshot to safetensors.
 
-        Works for ACTIVE models (bulk async GPU→CPU) and pseudo-sleep models
-        (reads from pinned weight store). For cumem-sleeping models, snapshots
-        must be pre-saved while ACTIVE (cumem backups lack shape metadata).
+        Works for ACTIVE models (reads param.data from GPU) and pseudo-sleep
+        models (reads from pinned weight store). For cumem-sleeping models,
+        snapshots must be pre-saved while ACTIVE (cumem backups lack shape info).
         """
         from safetensors.torch import save_file
         t0 = _time.perf_counter()
@@ -311,8 +276,11 @@ class Worker(WorkerBase):
                 if name in store:
                     tensors[name] = store[name].contiguous()
         else:
-            # ACTIVE models: bulk async GPU→CPU copy
-            tensors = self._bulk_gpu_to_cpu()
+            # ACTIVE models: read param.data directly from GPU
+            tensors = {
+                name: param.data.cpu().contiguous()
+                for name, param in model.named_parameters()
+            }
 
         os.makedirs(snapshot_path, exist_ok=True)
         save_file(tensors, os.path.join(snapshot_path, "snapshot.safetensors"))
