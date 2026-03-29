@@ -43,6 +43,22 @@ async def wake_up(raw_request: Request):
     return Response(status_code=200)
 
 
+@router.post("/save_snapshot")
+async def save_snapshot(raw_request: Request):
+    """Save model weight snapshot in-place (model stays sleeping).
+
+    Wakes weights → saves to file → sleeps back. Uses the EngineCore's
+    call_utility RPC to invoke Worker.save_snapshot_in_place() in the
+    subprocess. Model stays sleeping from Executor's perspective.
+    """
+    snapshot_path = raw_request.query_params.get("path")
+    if not snapshot_path:
+        return JSONResponse(content={"error": "path required"}, status_code=400)
+    client = engine_client(raw_request)
+    await client.save_snapshot(snapshot_path)
+    return Response(status_code=200)
+
+
 @router.post("/reload_tokenizer")
 async def reload_tokenizer(raw_request: Request):
     """Reload the tokenizer after a cross-GPU model migration.

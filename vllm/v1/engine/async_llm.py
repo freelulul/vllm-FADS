@@ -914,6 +914,9 @@ class AsyncLLM(EngineClient):
         if self.logger_manager is not None:
             self.logger_manager.record_sleep_state(0, 0)
 
+    async def save_snapshot(self, snapshot_path: str) -> None:
+        await self.engine_core.save_snapshot_async(snapshot_path)
+
     async def is_sleeping(self) -> bool:
         return await self.engine_core.is_sleeping_async()
 

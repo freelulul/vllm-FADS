@@ -1086,6 +1086,9 @@ class AsyncMPClient(MPClient):
     async def wake_up_async(self, tags: list[str] | None = None) -> None:
         await self.call_utility_async("wake_up", tags)
 
+    async def save_snapshot_async(self, snapshot_path: str) -> None:
+        await self.call_utility_async("save_snapshot", snapshot_path)
+
     async def is_sleeping_async(self) -> bool:
         return await self.call_utility_async("is_sleeping")
 
