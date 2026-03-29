@@ -258,50 +258,31 @@ class Worker(WorkerBase):
         logger.info("Saved weight snapshot: %d params to %s", len(tensors), snapshot_path)
 
     def save_snapshot_in_place(self, snapshot_path: str) -> None:
-        """Save snapshot while model is sleeping — zero GPU memory needed.
+        """Save model weight snapshot to safetensors.
 
-        After cumem L1 sleep, weights live in CPU backup tensors inside
-        cumem's pointer_to_data. This method reads those backups directly
-        and saves to safetensors. No GPU wake required.
+        Works for both ACTIVE and SLEEPING models:
+        - ACTIVE (cumem or standard): reads param.data from GPU
+        - SLEEPING (pseudo-sleep/pinned): reads from _pinned_weight_store
 
-        For pseudo-sleep models (migrated, no cumem), reads from the
-        pinned weight store instead.
+        For cumem-sleeping models, snapshots must be pre-saved while ACTIVE
+        (before first sleep) because cumem backups are raw byte buffers
+        without shape/dtype metadata.
         """
         from safetensors.torch import save_file
         t0 = _time.perf_counter()
         model = self.model_runner.model
         tensors = {}
 
-        if not self.vllm_config.model_config.enable_sleep_mode:
-            # Pseudo-sleep: weights in _pinned_weight_store
-            store = getattr(self, '_pinned_weight_store', {})
+        # Try pinned weight store first (pseudo-sleep migrated models)
+        store = getattr(self, '_pinned_weight_store', {})
+        if store:
             for name, param in model.named_parameters():
                 if name in store:
                     tensors[name] = store[name].contiguous()
-                else:
-                    tensors[name] = param.data.cpu().contiguous()
         else:
-            # Cumem sleep: read CPU backup tensors directly
-            from vllm.device_allocator.cumem import CuMemAllocator
-            allocator = CuMemAllocator.get_instance()
-
-            # Build a map: param gpu pointer → param name
-            # After cumem sleep, param.data_ptr() still holds the (unmapped) GPU address
-            ptr_to_name = {}
+            # Read param.data directly (works when model is ACTIVE on GPU)
             for name, param in model.named_parameters():
-                ptr_to_name[param.data_ptr()] = name
-
-            for ptr, alloc_data in allocator.pointer_to_data.items():
-                if alloc_data.cpu_backup_tensor is not None and ptr in ptr_to_name:
-                    tensors[ptr_to_name[ptr]] = alloc_data.cpu_backup_tensor.contiguous()
-
-            # Fallback: any params not matched via pointer (e.g., buffers)
-            for name, param in model.named_parameters():
-                if name not in tensors:
-                    try:
-                        tensors[name] = param.data.cpu().contiguous()
-                    except Exception:
-                        logger.warning("Cannot read param %s after sleep", name)
+                tensors[name] = param.data.cpu().contiguous()
 
         os.makedirs(snapshot_path, exist_ok=True)
         save_file(tensors, os.path.join(snapshot_path, "snapshot.safetensors"))
