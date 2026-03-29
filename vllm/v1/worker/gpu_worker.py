@@ -167,19 +167,6 @@ class Worker(WorkerBase):
 
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
 
-        # Check for snapshot save request (file-based trigger from scheduler)
-        my_name = self._get_served_name()
-        for t in glob.glob("/tmp/fads_snapshot_*"):
-            try:
-                with open(t) as f:
-                    req = _json.loads(f.read())
-                if req.get("served_model_name") == my_name:
-                    self.save_weight_snapshot(req["snapshot_path"])
-                    os.remove(t)
-                    break
-            except Exception as e:
-                logger.warning("Snapshot trigger error for %s: %s", t, e)
-
         # Migrated models (no cumem) use pseudo-sleep instead
         if not self.vllm_config.model_config.enable_sleep_mode:
             self._pseudo_sleep()
