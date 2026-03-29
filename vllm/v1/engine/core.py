@@ -734,6 +734,18 @@ class EngineCore:
         # Resume scheduling (applies to all levels)
         self.resume_scheduler()
 
+    def save_snapshot(self, snapshot_path: str) -> None:
+        """Save weight snapshot in-place while model is sleeping.
+
+        Calls Worker.save_snapshot_in_place() directly via collective_rpc,
+        bypassing Executor's is_sleeping gate. The worker wakes weights only
+        (~14 GiB, no KV cache), saves to file, sleeps back.
+        """
+        self.model_executor.collective_rpc(
+            "save_snapshot_in_place",
+            kwargs=dict(snapshot_path=snapshot_path),
+        )
+
     def is_sleeping(self) -> bool:
         """Check if engine is sleeping at any level."""
         return self.is_scheduler_paused() or self.model_executor.is_sleeping
