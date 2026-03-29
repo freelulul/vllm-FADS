@@ -260,11 +260,14 @@ class Worker(WorkerBase):
     def save_snapshot_in_place(self, snapshot_path: str) -> None:
         """Save model weight snapshot to safetensors.
 
-        Works for ACTIVE models (reads param.data from GPU) and pseudo-sleep
-        models (reads from pinned weight store). For cumem-sleeping models,
-        snapshots must be pre-saved while ACTIVE (cumem backups lack shape info).
+        Works in ALL model states:
+        - ACTIVE (cumem or standard): reads param.data from GPU directly
+        - SLEEPING (cumem): wakes weights only (~14 GiB, no KV cache ~50 GiB),
+          saves, then re-sleeps. Safe on memory-tight GPUs.
+        - SLEEPING (pseudo-sleep/pinned): reads from _pinned_weight_store
         """
         from safetensors.torch import save_file
+        from vllm.device_allocator.cumem import CuMemAllocator
         t0 = _time.perf_counter()
         model = self.model_runner.model
 
@@ -275,8 +278,24 @@ class Worker(WorkerBase):
             for name, param in model.named_parameters():
                 if name in store:
                     tensors[name] = store[name].contiguous()
+        elif self.vllm_config.model_config.enable_sleep_mode:
+            # Cumem model: might be sleeping. Wake weights only, save, re-sleep.
+            # This uses only ~weight_size GPU memory (no KV cache).
+            allocator = CuMemAllocator.get_instance()
+            was_sleeping = any(
+                d.cpu_backup_tensor is not None
+                for d in allocator.pointer_to_data.values()
+            )
+            if was_sleeping:
+                allocator.wake_up(tags=["weights"])
+            tensors = {
+                name: param.data.cpu().contiguous()
+                for name, param in model.named_parameters()
+            }
+            if was_sleeping:
+                allocator.sleep(offload_tags=("weights",))
         else:
-            # ACTIVE models: read param.data directly from GPU
+            # ACTIVE standard model: read param.data directly from GPU
             tensors = {
                 name: param.data.cpu().contiguous()
                 for name, param in model.named_parameters()
