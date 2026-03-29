@@ -244,18 +244,27 @@ class Worker(WorkerBase):
     def save_weight_snapshot(self, snapshot_path: str) -> None:
         """Save model weights to safetensors for cross-GPU migration.
 
-        Call while model is ACTIVE (weights on GPU). Each param is copied
-        to CPU individually. For 28 GiB models this takes ~40s (0.7 GB/s).
+        Saves each parameter individually to avoid holding all ~26 GiB in
+        CPU memory simultaneously (which can trigger OOM on the EngineCore
+        subprocess). Each param is saved as a separate safetensors file,
+        then the next param overwrites the CPU buffer.
         """
         from safetensors.torch import save_file
 
-        tensors = {
-            name: param.data.cpu().contiguous()
-            for name, param in self.model_runner.model.named_parameters()
-        }
         os.makedirs(snapshot_path, exist_ok=True)
-        save_file(tensors, os.path.join(snapshot_path, "snapshot.safetensors"))
-        logger.info("Saved weight snapshot: %d params to %s", len(tensors), snapshot_path)
+        n = 0
+        for name, param in self.model_runner.model.named_parameters():
+            cpu_tensor = param.data.cpu().contiguous()
+            safe_name = name.replace("/", "_")
+            save_file({name: cpu_tensor}, os.path.join(snapshot_path, f"{safe_name}.safetensors"))
+            del cpu_tensor
+            n += 1
+        # Write manifest for reload
+        import json as _json
+        names = [n for n, _ in self.model_runner.model.named_parameters()]
+        with open(os.path.join(snapshot_path, "manifest.json"), "w") as f:
+            _json.dump(names, f)
+        logger.info("Saved weight snapshot: %d params to %s", n, snapshot_path)
 
     def save_snapshot_in_place(self, snapshot_path: str) -> None:
         """Save model weight snapshot to safetensors.
@@ -271,41 +280,11 @@ class Worker(WorkerBase):
         t0 = _time.perf_counter()
         model = self.model_runner.model
 
-        # Pseudo-sleep models: read from pinned store
-        store = getattr(self, '_pinned_weight_store', {})
-        if store:
-            tensors = {}
-            for name, param in model.named_parameters():
-                if name in store:
-                    tensors[name] = store[name].contiguous()
-        elif self.vllm_config.model_config.enable_sleep_mode:
-            # Cumem model: might be sleeping. Wake weights only, save, re-sleep.
-            # This uses only ~weight_size GPU memory (no KV cache).
-            allocator = CuMemAllocator.get_instance()
-            was_sleeping = any(
-                d.cpu_backup_tensor is not None
-                for d in allocator.pointer_to_data.values()
-            )
-            if was_sleeping:
-                allocator.wake_up(tags=["weights"])
-            tensors = {
-                name: param.data.cpu().contiguous()
-                for name, param in model.named_parameters()
-            }
-            if was_sleeping:
-                allocator.sleep(offload_tags=("weights",))
-        else:
-            # ACTIVE standard model: read param.data directly from GPU
-            tensors = {
-                name: param.data.cpu().contiguous()
-                for name, param in model.named_parameters()
-            }
-
-        os.makedirs(snapshot_path, exist_ok=True)
-        save_file(tensors, os.path.join(snapshot_path, "snapshot.safetensors"))
-        n_total = len(list(model.named_parameters()))
-        logger.info("save_snapshot_in_place: %d/%d params saved to %s in %.2fs",
-                     len(tensors), n_total, snapshot_path, _time.perf_counter() - t0)
+        # Delegate to save_weight_snapshot which uses per-param files
+        # (low CPU memory: only one param in memory at a time)
+        self.save_weight_snapshot(snapshot_path)
+        logger.info("save_snapshot_in_place: %s in %.2fs",
+                     snapshot_path, _time.perf_counter() - t0)
 
     def _pseudo_sleep(self) -> None:
         """Offload weights to pinned CPU memory via DMA.
@@ -433,14 +412,26 @@ class Worker(WorkerBase):
             self.model_runner.load_model(load_dummy_weights=True)
 
         # 6. Overwrite dummy weights with real weights from snapshot
-        snapshot_file = os.path.join(snapshot_path, "snapshot.safetensors")
-        real_weights = load_file(snapshot_file, device="cpu")
+        #    Supports both single-file (legacy) and per-param file format.
+        single_file = os.path.join(snapshot_path, "snapshot.safetensors")
         loaded = 0
-        for name, param in self.model_runner.model.named_parameters():
-            if name in real_weights:
-                param.data.copy_(real_weights[name])
-                loaded += 1
-        del real_weights
+        if os.path.exists(single_file):
+            real_weights = load_file(single_file, device="cpu")
+            for name, param in self.model_runner.model.named_parameters():
+                if name in real_weights:
+                    param.data.copy_(real_weights[name])
+                    loaded += 1
+            del real_weights
+        else:
+            # Per-param files: load one at a time (low CPU memory usage)
+            for name, param in self.model_runner.model.named_parameters():
+                safe_name = name.replace("/", "_")
+                pf = os.path.join(snapshot_path, f"{safe_name}.safetensors")
+                if os.path.exists(pf):
+                    data = load_file(pf, device="cpu")
+                    param.data.copy_(data[name])
+                    del data
+                    loaded += 1
         gc.collect()
         # Ensure all weight copies are complete before any CUDA kernel launch
         torch.cuda.synchronize()
