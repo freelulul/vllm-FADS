@@ -196,6 +196,15 @@ class CuMemAllocator:
         total_bytes = 0
         backup_bytes = 0
 
+        # Phase 1: Allocate CPU backup tensors and launch async DMA
+        import ctypes
+        from vllm.distributed.device_communicators.cuda_wrapper import cudaStream_t
+        stream = cudaStream_t()
+        libcudart.cudaStreamCreate(ctypes.byref(stream))
+
+        offload_handles = []  # handles that were backed up (DMA in flight)
+        discard_handles = []  # handles to unmap without backup
+
         for ptr, data in self.pointer_to_data.items():
             handle = data.handle
             total_bytes += handle[1]
@@ -209,8 +218,25 @@ class CuMemAllocator:
                     pin_memory=is_pin_memory_available(),
                 )
                 cpu_ptr = cpu_backup_tensor.data_ptr()
-                libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
+                libcudart.cudaMemcpyAsync(
+                    cpu_ptr, ptr, size_in_bytes, stream
+                )
                 data.cpu_backup_tensor = cpu_backup_tensor
+                offload_handles.append(handle)
+            else:
+                discard_handles.append(handle)
+
+        # Phase 2: Unmap discards IMMEDIATELY (frees KV cache memory ~40 GiB).
+        # This runs while weight DMA is still in flight — safe because
+        # discards have NO async DMA, their memory can be freed now.
+        # Critical for parallel sleep+wake: frees space for wake's cuMemCreate.
+        for handle in discard_handles:
+            unmap_and_release(handle)
+
+        # Phase 3: Wait for weight DMA to complete, then unmap weights
+        libcudart.cudaStreamSynchronize(stream)
+        libcudart.cudaStreamDestroy(stream)
+        for handle in offload_handles:
             unmap_and_release(handle)
 
         logger.info(
@@ -247,6 +273,8 @@ class CuMemAllocator:
             back to GPU memory. If None, all memory allocation will be loaded
             back to GPU memory.
         """
+        # Phase 1: VMM create+map for all allocations (must complete before DMA)
+        restore_list = []  # (gpu_ptr, cpu_ptr, size) tuples for DMA
         for ptr, data in self.pointer_to_data.items():
             if tags is None or data.tag in tags:
                 handle = data.handle
@@ -258,8 +286,29 @@ class CuMemAllocator:
                             cpu_backup_tensor.numel() * cpu_backup_tensor.element_size()
                         )
                         cpu_ptr = cpu_backup_tensor.data_ptr()
-                        libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
-                        data.cpu_backup_tensor = None
+                        restore_list.append((ptr, cpu_ptr, size_in_bytes))
+
+        # Phase 2: Launch all DMA async, sync once at end
+        if restore_list:
+            import ctypes
+            from vllm.distributed.device_communicators.cuda_wrapper import (
+                cudaStream_t,
+            )
+            stream = cudaStream_t()
+            libcudart.cudaStreamCreate(ctypes.byref(stream))
+
+            for gpu_ptr, cpu_ptr, size_in_bytes in restore_list:
+                libcudart.cudaMemcpyAsync(
+                    gpu_ptr, cpu_ptr, size_in_bytes, stream
+                )
+
+            libcudart.cudaStreamSynchronize(stream)
+            libcudart.cudaStreamDestroy(stream)
+
+        # Phase 3: Release CPU backup references
+        for ptr, data in self.pointer_to_data.items():
+            if tags is None or data.tag in tags:
+                data.cpu_backup_tensor = None
 
     @contextmanager
     def use_memory_pool(self, tag: str | None = None):
