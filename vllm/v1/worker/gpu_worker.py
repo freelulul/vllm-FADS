@@ -404,6 +404,12 @@ class Worker(WorkerBase):
                 continue  # Keep buffer on GPU (small, recomputed)
             buffer.data = torch.empty(0, device="cpu")
 
+        # NOTE: KV cache is intentionally NOT freed during pseudo_sleep.
+        # It's allocated small (~2 GiB via reload_for_migration) so it
+        # doesn't block other models from waking. Re-initializing it on
+        # every wake is too expensive (~1-2s per cycle), which destroys
+        # throughput for frequently-switched models.
+
         gc.collect()
         try:
             torch.cuda.empty_cache()
@@ -433,6 +439,7 @@ class Worker(WorkerBase):
 
         torch.cuda.synchronize()
         # Keep _pinned_weight_store alive for reuse on next sleep cycle
+        # KV cache stays on GPU (small, allocated once in reload_for_migration)
         logger.info("Pseudo-wake restored weights in %.2fs",
                      _time.perf_counter() - t0)
 
@@ -541,11 +548,15 @@ class Worker(WorkerBase):
         # Ensure all weight copies are complete before any CUDA kernel launch
         torch.cuda.synchronize()
 
-        # 7. Initialize KV cache (use actual free memory, not profiling)
+        # 7. Initialize KV cache with SMALL allocation.
+        #    The KV cache stays on GPU during pseudo_sleep (not freed) to
+        #    avoid expensive re-initialization on every wake cycle.
+        #    A small KV (~2 GiB) is sufficient for low-concurrency serving
+        #    and doesn't block other models from waking on this GPU.
         with set_current_vllm_config(self.vllm_config):
             kv_cache_spec = self.get_kv_cache_spec()
             free_bytes = torch.cuda.mem_get_info()[0]
-            available_memory = int(free_bytes * 0.9)
+            available_memory = min(int(free_bytes * 0.05), 2 * 1024**3)
             kv_cache_configs = get_kv_cache_configs(
                 self.vllm_config, [kv_cache_spec], [available_memory]
             )
