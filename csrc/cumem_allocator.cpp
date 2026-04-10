@@ -488,6 +488,17 @@ void my_free(void* ptr, ssize_t size, int device, CUstream stream) {
     return;
   }
 
+  // Skip sentinel: (0, 0, 0, 0) means the allocation was already freed
+  // (e.g., during cumem.sleep() before model migration). The Python callback
+  // returns this sentinel when the pointer is not in pointer_to_data.
+  // We must skip all CUDA cleanup to avoid double-free / invalid argument.
+  if (recv_d_mem == 0) {
+    Py_DECREF(py_ptr);
+    Py_DECREF(py_result);
+    PyGILState_Release(gstate);
+    return;
+  }
+
   // For ROCm, copy the Python list of (addr,size) pairs into C arrays while
   // holding the GIL. Then release the GIL and call the unmap/release helper
   // using the copied arrays. This avoids calling PyList_* APIs without the

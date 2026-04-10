@@ -367,24 +367,54 @@ class Worker(WorkerBase):
         # Async DMA copy: GPU → pinned CPU
         for name, param in model.named_parameters():
             self._pinned_weight_store[name].copy_(param.data, non_blocking=True)
+        skipped_buffers = set()
         for name, buffer in model.named_buffers():
-            self._pinned_weight_store[f"__buffer__{name}"].copy_(
-                buffer.data, non_blocking=True)
+            key = f"__buffer__{name}"
+            try:
+                # Re-allocate pinned entry if it was removed (skipped in prior cycle)
+                if key not in self._pinned_weight_store:
+                    self._pinned_weight_store[key] = torch.empty_like(
+                        buffer.data, device="cpu", pin_memory=True)
+                self._pinned_weight_store[key].copy_(
+                    buffer.data, non_blocking=True)
+            except Exception as e:
+                # Buffer copy can fail after migration if the buffer's GPU
+                # memory is in a stale state (e.g., cumem-allocated rotary
+                # cos_sin_cache whose underlying VMM mapping was freed).
+                # The buffer stays on GPU (not freed), so it remains usable.
+                # On the next sleep/wake cycle it re-enters the normal path.
+                logger.warning(
+                    "Pseudo-sleep: skipping buffer %s (stays on GPU): %s",
+                    name, e)
+                skipped_buffers.add(key)
+                # Remove the pinned entry so _pseudo_wake won't restore
+                # garbage (the empty_like allocation has random data).
+                self._pinned_weight_store.pop(key, None)
+                # Synchronize clears the CUDA error state so the next
+                # buffer copy in this loop doesn't inherit a stale error.
+                torch.cuda.synchronize()
         torch.cuda.synchronize()
 
         # Free GPU tensors (safe: all copies completed)
         for name, param in model.named_parameters():
             param.data = torch.empty(0, device="cpu")
         for name, buffer in model.named_buffers():
+            key = f"__buffer__{name}"
+            if key in skipped_buffers:
+                continue  # Keep buffer on GPU (small, recomputed)
             buffer.data = torch.empty(0, device="cpu")
 
         gc.collect()
-        torch.cuda.empty_cache()
+        try:
+            torch.cuda.empty_cache()
+        except Exception as e:
+            logger.warning("Pseudo-sleep: empty_cache failed (cumem interaction): %s", e)
 
         free_after = torch.cuda.mem_get_info()[0]
-        logger.info("Pseudo-sleep freed %.1f GiB in %.2fs",
+        logger.info("Pseudo-sleep freed %.1f GiB in %.2fs (skipped %d buffers)",
                      (free_after - free_before) / 1024**3,
-                     _time.perf_counter() - t0)
+                     _time.perf_counter() - t0,
+                     len(skipped_buffers))
 
     def _pseudo_wake(self) -> None:
         """Restore weights from pinned CPU memory via DMA."""
@@ -428,13 +458,29 @@ class Worker(WorkerBase):
         # 1. Clear old model's cumem state (already sleeping, GPU memory freed)
         allocator = CuMemAllocator.get_instance()
         allocator.clear_all_backups()
+        logger.info("reload_for_migration: cumem backups cleared")
 
-        # 2. Delete old model runner
+        # 2. Fully release CUDA graph state, then delete model runner.
+        #    The global graph pool holds captures_underway references that
+        #    block allocator operations. Must be cleared before reload.
+        from vllm.compilation.cuda_graph import CUDAGraphWrapper
+        from vllm.platforms import current_platform
+        CUDAGraphWrapper.clear_all_graphs()
+        # Reset the global graph pool singleton so captures_underway is empty
+        current_platform.__class__._global_graph_pool = None
         del self.model_runner
         self.model_runner = None  # type: ignore
         gc.collect()
+        gc.collect()  # Double collect for weak refs
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()  # Now safe — captures_underway is empty
+        free_after_cleanup = torch.cuda.mem_get_info()[0]
+        logger.info(
+            "reload_for_migration: old runner deleted, %.1f GiB free",
+            free_after_cleanup / 1024**3,
+        )
 
-        # 3. Create fresh ModelConfig from new model's config.json
+        # 3. Create fresh ModelConfig (standard allocator, eager mode).
         old_mc = self.vllm_config.model_config
         self.vllm_config.model_config = ModelConfig(
             model=new_model_path,
@@ -445,7 +491,13 @@ class Worker(WorkerBase):
             enable_sleep_mode=False,
             served_model_name=old_mc.served_model_name,
         )
+        # Reset torch.compile + CUDA graph state to avoid stale cache
+        torch._dynamo.reset()
+        from vllm.config.compilation import CompilationMode, CUDAGraphMode
         self.vllm_config.compilation_config.static_forward_context.clear()
+        self.vllm_config.compilation_config.mode = CompilationMode.NONE
+        self.vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        self.vllm_config.compilation_config.cudagraph_capture_sizes = []
         self.model_config = self.vllm_config.model_config
 
         # 4. Create new model runner
@@ -460,7 +512,7 @@ class Worker(WorkerBase):
             )
             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
 
-        # 5. Load architecture with dummy weights (fast: skips safetensors I/O)
+        # 5. Load architecture with dummy weights (standard allocator)
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model(load_dummy_weights=True)
 
@@ -507,6 +559,32 @@ class Worker(WorkerBase):
             _pending_migration_kv_config = generate_scheduler_kv_cache_config(
                 kv_cache_configs
             )
+
+        # 8. Recompute rotary embedding cos_sin_cache.
+        #    This is the ONLY buffer with invalid GPU memory after migration
+        #    (confirmed via cudaMemcpy probe: 96/97 valid, only cos_sin_cache
+        #    invalid). It's computed during model __init__ via GPU ops that
+        #    interact with stale cumem state. Recomputing fixes the issue.
+        from vllm.model_executor.layers.rotary_embedding.base import (
+            RotaryEmbeddingBase,
+        )
+        fixed = 0
+        for module in self.model_runner.model.modules():
+            if isinstance(module, RotaryEmbeddingBase) and hasattr(module, 'cos_sin_cache'):
+                cache = module._compute_cos_sin_cache()
+                if not getattr(module, 'use_flashinfer', False):
+                    cache = cache.to(module.dtype)
+                module.cos_sin_cache = cache
+                fixed += 1
+        if fixed:
+            logger.info("reload_for_migration: recomputed %d cos_sin_cache(s)", fixed)
+        torch.cuda.synchronize()
+
+        # 9. Warmup: initialize attention backends via dummy forward pass
+        with set_current_vllm_config(self.vllm_config):
+            self.model_runner._dummy_run(
+                num_tokens=1, skip_eplb=True, is_profile=True)
+        logger.info("reload_for_migration: warmup complete")
 
         elapsed = _time.perf_counter() - t0
         n_params = len(list(self.model_runner.model.named_parameters()))

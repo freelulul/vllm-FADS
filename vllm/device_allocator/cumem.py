@@ -164,7 +164,16 @@ class CuMemAllocator:
         """
         Internal method to look up the allocation data
         when memory is freed in the memory pool."""
-        data = self.pointer_to_data.pop(ptr)
+        data = self.pointer_to_data.pop(ptr, None)
+        if data is None:
+            # Pointer not tracked by cumem — already freed during sleep()
+            # before migration, or allocated by standard allocator post-migration.
+            # Return sentinel (0,0,0,0) so C-side my_free skips cleanup.
+            logger.debug(
+                "Free callback: unknown ptr %s — returning skip sentinel",
+                ptr,
+            )
+            return (0, 0, 0, 0)
         if data.cpu_backup_tensor is not None:
             data.cpu_backup_tensor = None
         logger.debug(
